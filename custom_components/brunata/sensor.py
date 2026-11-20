@@ -122,6 +122,7 @@ async def async_setup_entry(
         is_water = cost_type.startswith(("WW", "KW"))
         consumption_unit = "m³" if is_water else "kWh"
         consumption_device_class = SensorDeviceClass.WATER if is_water else SensorDeviceClass.ENERGY
+        forecast_device_class = SensorDeviceClass.WATER if is_water else SensorDeviceClass.ENERGY
 
         if monthly_by_cost_type.get(cost_type):
             entities.append(
@@ -220,7 +221,7 @@ async def async_setup_entry(
                         key=f"forecast_current_{cost_type.lower()}",
                         name=f"{label} – {cost_type} – Aktuell (YTD)",
                         kind=f"forecast_current:{cost_type}",
-                        device_class=SensorDeviceClass.ENERGY,
+                        device_class=forecast_device_class,
                         state_class=SensorStateClass.TOTAL,
                     ),
                 )
@@ -233,7 +234,6 @@ async def async_setup_entry(
                         key=f"forecast_previous_year_{cost_type.lower()}",
                         name=f"{label} – {cost_type} – Vorjahr",
                         kind=f"forecast_previous:{cost_type}",
-                        device_class=SensorDeviceClass.ENERGY,
                         state_class=SensorStateClass.MEASUREMENT,
                     ),
                 )
@@ -246,7 +246,6 @@ async def async_setup_entry(
                         key=f"forecast_forecast_{cost_type.lower()}",
                         name=f"{label} – {cost_type} – Prognose",
                         kind=f"forecast_forecast:{cost_type}",
-                        device_class=SensorDeviceClass.ENERGY,
                         state_class=SensorStateClass.MEASUREMENT,
                     ),
                 )
@@ -259,7 +258,6 @@ async def async_setup_entry(
                         key=f"forecast_difference_{cost_type.lower()}",
                         name=f"{label} – {cost_type} – Mehrverbrauch",
                         kind=f"forecast_difference:{cost_type}",
-                        device_class=SensorDeviceClass.ENERGY,
                         state_class=SensorStateClass.MEASUREMENT,
                     ),
                 )
@@ -418,7 +416,8 @@ class BrunataSensor(CoordinatorEntity[BrunataDataCoordinator], SensorEntity):
         if self._def.kind.startswith("forecast_"):
             _, cost_type = self._def.kind.split(":", 1)
             fc: ConsumptionForecast | None = (data.get("forecast_by_cost_type") or {}).get(cost_type)
-            return (fc.unit if fc else None) or "kWh"
+            default_unit = "m³" if cost_type.startswith(("WW", "KW")) else "kWh"
+            return (fc.unit if fc else None) or default_unit
         if self._def.kind.startswith("room:"):
             _, cost_type, room_id = self._def.kind.split(":", 2)
             rooms: list[RoomConsumption] = (data.get("room_by_cost_type") or {}).get(cost_type) or []
