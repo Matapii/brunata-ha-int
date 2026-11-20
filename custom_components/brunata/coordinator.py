@@ -112,134 +112,143 @@ class BrunataDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return self._client
 
     async def _async_update_data(self) -> dict[str, Any]:
+        """Fetch data from Brunata with automatic session retry on login failure."""
+        for attempt in range(2):
+            try:
+                return await self._async_update_data_inner()
+            except LoginError as err:
+                _LOGGER.debug("LoginError encountered (attempt %d/2): %s", attempt + 1, err)
+                await self.async_shutdown()
+                if attempt == 0:
+                    continue
+                raise ConfigEntryAuthFailed("Brunata authentication failed") from err
+            except (httpx.HTTPError, TimeoutError) as err:
+                raise UpdateFailed(f"Brunata communication error: {err}") from err
+            except Exception as err:  # noqa: BLE001
+                raise UpdateFailed(f"Unexpected Brunata error: {err}") from err
+
+    async def _async_update_data_inner(self) -> dict[str, Any]:
         """Fetch data from Brunata."""
         client = await self._async_get_client()
 
-        try:
-            # Ensure we only log in once.
-            # The API client doesn't guard login() with a lock, so running several
-            # requests concurrently can trigger multiple simultaneous logins and fail.
-            account = await client.get_account()
+        # Ensure we only log in once.
+        # The API client doesn't guard login() with a lock, so running several
+        # requests concurrently can trigger multiple simultaneous logins and fail.
+        account = await client.get_account()
 
-            dashboard_dates_task = client.get_dashboard_dates()
-            meter_readings_task = client.get_meter_readings()
-            periods_task = client.get_periods()
+        dashboard_dates_task = client.get_dashboard_dates()
+        meter_readings_task = client.get_meter_readings()
+        periods_task = client.get_periods()
 
-            (
-                dashboard_dates,
-                meter_readings_by_cost_type,
-                periods,
-            ) = await asyncio.gather(
-                dashboard_dates_task,
-                meter_readings_task,
-                periods_task,
+        (
+            dashboard_dates,
+            meter_readings_by_cost_type,
+            periods,
+        ) = await asyncio.gather(
+            dashboard_dates_task,
+            meter_readings_task,
+            periods_task,
+        )
+
+        # Fetch monthly consumption for all periods and merge per cost_type so the
+        # cumulative series spans all years (avoids Energy dashboard "reset" at new year).
+        monthly_by_cost_type: dict[str, list[Reading]] = {}
+        for i in range(len(periods)):
+            heating_i, hot_water_i, cold_water_i = await asyncio.gather(
+                client.get_monthly_consumptions(
+                    ReadingKind.heating, in_kwh=True, period_index=i
+                ),
+                client.get_monthly_consumptions(
+                    ReadingKind.hot_water, in_kwh=False, period_index=i
+                ),
+                client.get_monthly_consumptions(
+                    ReadingKind.cold_water, in_kwh=False, period_index=i
+                ),
+            )
+            for ct, readings in (heating_i or {}).items():
+                monthly_by_cost_type.setdefault(ct, []).extend(readings)
+            for ct, readings in (hot_water_i or {}).items():
+                monthly_by_cost_type.setdefault(ct, []).extend(readings)
+            for ct, readings in (cold_water_i or {}).items():
+                monthly_by_cost_type.setdefault(ct, []).extend(readings)
+        for ct in monthly_by_cost_type:
+            monthly_by_cost_type[ct] = sorted(
+                monthly_by_cost_type[ct], key=lambda r: r.timestamp
             )
 
-            # Fetch monthly consumption for all periods and merge per cost_type so the
-            # cumulative series spans all years (avoids Energy dashboard "reset" at new year).
-            monthly_by_cost_type: dict[str, list[Reading]] = {}
-            for i in range(len(periods)):
-                heating_i, hot_water_i, cold_water_i = await asyncio.gather(
-                    client.get_monthly_consumptions(
-                        ReadingKind.heating, in_kwh=True, period_index=i
-                    ),
-                    client.get_monthly_consumptions(
-                        ReadingKind.hot_water, in_kwh=False, period_index=i
-                    ),
-                    client.get_monthly_consumptions(
-                        ReadingKind.cold_water, in_kwh=False, period_index=i
-                    ),
-                )
-                for ct, readings in (heating_i or {}).items():
-                    monthly_by_cost_type.setdefault(ct, []).extend(readings)
-                for ct, readings in (hot_water_i or {}).items():
-                    monthly_by_cost_type.setdefault(ct, []).extend(readings)
-                for ct, readings in (cold_water_i or {}).items():
-                    monthly_by_cost_type.setdefault(ct, []).extend(readings)
-            for ct in monthly_by_cost_type:
-                monthly_by_cost_type[ct] = sorted(
-                    monthly_by_cost_type[ct], key=lambda r: r.timestamp
-                )
+        comparison_task = client.get_consumption_comparison()
+        forecast_task = client.get_consumption_forecast()
+        room_task = client.get_room_consumption()
 
-            comparison_task = client.get_consumption_comparison()
-            forecast_task = client.get_consumption_forecast()
-            room_task = client.get_room_consumption()
+        comparison_by_cost_type, forecast_by_cost_type, room_by_cost_type = await asyncio.gather(
+            comparison_task, forecast_task, room_task
+        )
 
-            comparison_by_cost_type, forecast_by_cost_type, room_by_cost_type = await asyncio.gather(
-                comparison_task, forecast_task, room_task
+        data: dict[str, Any] = {
+            "account": account,
+            "dashboard_dates": dashboard_dates,
+            # New multi-cost-type model
+            "meter_readings_by_cost_type": meter_readings_by_cost_type or {},
+            "monthly_by_cost_type": monthly_by_cost_type,
+            "comparison_by_cost_type": comparison_by_cost_type or {},
+            "forecast_by_cost_type": forecast_by_cost_type or {},
+            "room_by_cost_type": room_by_cost_type or {},
+        }
+
+        kwh_histories_by_cost_type: dict[str, list[MeterReading]] = {}
+        kwh_totals_by_cost_type: dict[str, MeterReading] = {}
+        for cost_type, monthly in monthly_by_cost_type.items():
+            if not monthly:
+                continue
+            _kind, _unit, history = _cumulative_kwh_history(cost_type=cost_type, monthly=monthly)
+            if not history:
+                continue
+            kwh_histories_by_cost_type[cost_type] = history
+            kwh_totals_by_cost_type[cost_type] = history[-1]
+        data["kwh_histories_by_cost_type"] = kwh_histories_by_cost_type
+        data["kwh_totals_by_cost_type"] = kwh_totals_by_cost_type
+
+        uid = self.entry.unique_id or self.entry.entry_id
+
+        # One-time cleanup: remove obsolete statistic_ids from earlier iterations
+        # so they don't show up in Energy dashboard selection.
+        if not self._cleared_obsolete_statistics:
+            self._cleared_obsolete_statistics = True
+            try:
+                ids = await async_list_statistic_ids(self.hass)
+                obsolete = [
+                    i["statistic_id"]
+                    for i in ids
+                    if i.get("statistic_id", "").startswith(f"{DOMAIN}:{uid}_")
+                    and (
+                        "_meter_" in i.get("statistic_id", "")
+                        or "_monthly_" in i.get("statistic_id", "")
+                        or "_kwh_total_ww" in i.get("statistic_id", "")
+                        or "_kwh_total_kw" in i.get("statistic_id", "")
+                    )
+                ]
+                if obsolete:
+                    get_recorder_instance(self.hass).async_clear_statistics(obsolete)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Failed to clear obsolete statistics: %s", err)
+
+        # Backfill only the synthetic cumulative series, not the physical meters.
+        for cost_type, history in kwh_histories_by_cost_type.items():
+            kind = _kind_from_cost_type(cost_type)
+            label = {
+                ReadingKind.heating: "Heizung",
+                ReadingKind.hot_water: "Warmwasser",
+                ReadingKind.cold_water: "KaltWasser",
+            }.get(kind, cost_type)
+            unit = history[-1].unit if history else None
+            unit_label = "m³" if kind in (ReadingKind.hot_water, ReadingKind.cold_water) else "kWh"
+            import_series_as_sum(
+                self.hass,
+                statistic_id=f"{DOMAIN}:{uid}_kwh_total_{cost_type.lower()}",
+                name=f"Brunata {uid} – {label} – {cost_type} – Verbrauch (kumulativ, {unit_label})",
+                unit=unit,
+                points=((r.timestamp, float(r.value)) for r in history),
             )
 
-            data: dict[str, Any] = {
-                "account": account,
-                "dashboard_dates": dashboard_dates,
-                # New multi-cost-type model
-                "meter_readings_by_cost_type": meter_readings_by_cost_type or {},
-                "monthly_by_cost_type": monthly_by_cost_type,
-                "comparison_by_cost_type": comparison_by_cost_type or {},
-                "forecast_by_cost_type": forecast_by_cost_type or {},
-                "room_by_cost_type": room_by_cost_type or {},
-            }
-
-            kwh_histories_by_cost_type: dict[str, list[MeterReading]] = {}
-            kwh_totals_by_cost_type: dict[str, MeterReading] = {}
-            for cost_type, monthly in monthly_by_cost_type.items():
-                if not monthly:
-                    continue
-                _kind, _unit, history = _cumulative_kwh_history(cost_type=cost_type, monthly=monthly)
-                if not history:
-                    continue
-                kwh_histories_by_cost_type[cost_type] = history
-                kwh_totals_by_cost_type[cost_type] = history[-1]
-            data["kwh_histories_by_cost_type"] = kwh_histories_by_cost_type
-            data["kwh_totals_by_cost_type"] = kwh_totals_by_cost_type
-
-            uid = self.entry.unique_id or self.entry.entry_id
-
-            # One-time cleanup: remove obsolete statistic_ids from earlier iterations
-            # so they don't show up in Energy dashboard selection.
-            if not self._cleared_obsolete_statistics:
-                self._cleared_obsolete_statistics = True
-                try:
-                    ids = await async_list_statistic_ids(self.hass)
-                    obsolete = [
-                        i["statistic_id"]
-                        for i in ids
-                        if i.get("statistic_id", "").startswith(f"{DOMAIN}:{uid}_")
-                        and (
-                            "_meter_" in i.get("statistic_id", "")
-                            or "_monthly_" in i.get("statistic_id", "")
-                            or "_kwh_total_ww" in i.get("statistic_id", "")
-                            or "_kwh_total_kw" in i.get("statistic_id", "")
-                        )
-                    ]
-                    if obsolete:
-                        get_recorder_instance(self.hass).async_clear_statistics(obsolete)
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.debug("Failed to clear obsolete statistics: %s", err)
-
-            # Backfill only the synthetic cumulative series, not the physical meters.
-            for cost_type, history in kwh_histories_by_cost_type.items():
-                kind = _kind_from_cost_type(cost_type)
-                label = {
-                    ReadingKind.heating: "Heizung",
-                    ReadingKind.hot_water: "Warmwasser",
-                    ReadingKind.cold_water: "KaltWasser",
-                }.get(kind, cost_type)
-                unit = history[-1].unit if history else None
-                unit_label = "m³" if kind in (ReadingKind.hot_water, ReadingKind.cold_water) else "kWh"
-                import_series_as_sum(
-                    self.hass,
-                    statistic_id=f"{DOMAIN}:{uid}_kwh_total_{cost_type.lower()}",
-                    name=f"Brunata {uid} – {label} – {cost_type} – Verbrauch (kumulativ, {unit_label})",
-                    unit=unit,
-                    points=((r.timestamp, float(r.value)) for r in history),
-                )
-
-            return data
-        except LoginError as err:
-            raise ConfigEntryAuthFailed("Brunata authentication failed") from err
-        except (httpx.HTTPError, TimeoutError) as err:
-            raise UpdateFailed(f"Brunata communication error: {err}") from err
-        except Exception as err:  # noqa: BLE001
-            raise UpdateFailed(f"Unexpected Brunata error: {err}") from err
+        return data
 
